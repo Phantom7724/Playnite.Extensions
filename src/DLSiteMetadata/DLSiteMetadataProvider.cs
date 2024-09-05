@@ -1,72 +1,116 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using Extensions.Common;
 using Microsoft.Extensions.Logging;
 using Playnite.SDK;
 using Playnite.SDK.Models;
 using Playnite.SDK.Plugins;
 
-namespace DLSiteMetadata;
+namespace GetchuMetadata;
 
-public class DLSiteMetadataProvider : OnDemandMetadataProvider
+public class GetchuMetadataProvider : OnDemandMetadataProvider
 {
     private readonly IPlayniteAPI _playniteAPI;
     private readonly Settings _settings;
-    private readonly ILogger<DLSiteMetadataProvider> _logger;
+    private readonly ILogger<GetchuMetadataProvider> _logger;
 
     private readonly MetadataRequestOptions _options;
     private Game Game => _options.GameData;
     private bool IsBackgroundDownload => _options.IsBackgroundDownload;
 
-    public override List<MetadataField> AvailableFields => DLSiteMetadataPlugin.Fields;
+    private static readonly HttpClient HttpClient = new();
 
-    public DLSiteMetadataProvider(IPlayniteAPI playniteAPI, Settings settings, MetadataRequestOptions options)
+    public override List<MetadataField> AvailableFields => GetchuMetadataPlugin.Fields;
+
+    public GetchuMetadataProvider(IPlayniteAPI playniteAPI, Settings settings, MetadataRequestOptions options)
     {
         _playniteAPI = playniteAPI;
         _settings = settings;
         _options = options;
 
-        _logger = CustomLogger.GetLogger<DLSiteMetadataProvider>(nameof(DLSiteMetadataProvider));
+        _logger = CustomLogger.GetLogger<GetchuMetadataProvider>(nameof(GetchuMetadataProvider));
     }
 
     private ScrapperResult? _result;
     private bool _didRun;
 
-    public static string? GetLinkFromGame(Game game)
+    private static string? GetLinkFromGame(Game game)
     {
-        if (game.Name is not null)
-        {
-            if (game.Name.StartsWith(Scrapper.SiteBaseUrl)) return game.Name;
+        if (game.Name is not null && game.Name.StartsWith(Scrapper.SiteBaseUrl))
+            return game.Name;
 
-            if (game.Name.StartsWith("RJ", StringComparison.OrdinalIgnoreCase) ||
-                game.Name.StartsWith("RE", StringComparison.OrdinalIgnoreCase))
+        return game.Links?.FirstOrDefault(link => link.Name.Equals("Getchu", StringComparison.OrdinalIgnoreCase))?.Url;
+    }
+
+    public static class StringExtensions
+    {
+        public static int LevenshteinDistance(string s, string t)
+        {
+            var d = new int[s.Length + 1, t.Length + 1];
+
+            for (var i = 0; i <= s.Length; i++)
+                d[i, 0] = i;
+            for (var j = 0; j <= t.Length; j++)
+                d[0, j] = j;
+
+            for (var i = 1; i <= s.Length; i++)
             {
-                return $"https://www.dlsite.com/maniax/work/=/product_id/{game.Name}.html";
+                for (var j = 1; j <= t.Length; j++)
+                {
+                    var cost = (t[j - 1] == s[i - 1]) ? 0 : 1;
+                    d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
+                }
             }
+
+            return d[s.Length, t.Length];
         }
 
-        var dlSiteLink =
-            game.Links?.FirstOrDefault(link => link.Name.Equals("DLsite", StringComparison.OrdinalIgnoreCase));
-        return dlSiteLink?.Url;
+        public static double CalculateCombinedScore(string search, string title)
+        {
+            var levenshteinDistance = LevenshteinDistance(search.ToLower(), title.ToLower());
+            var maxLength = Math.Max(search.Length, title.Length);
+            var score = 1.0 - (double)levenshteinDistance / maxLength;
+
+            if (title.Equals(search, StringComparison.OrdinalIgnoreCase))
+            {
+                score += 0.2;  // Increase score for exact matches
+            }
+            else if (title.ToLower().Contains(search.ToLower()))
+            {
+                score += 0.1; // Increase score for partial matches
+            }
+
+            return score;
+        }
+
+        public static string? ExtractIdFromUrl(string url)
+        {
+            var match = Regex.Match(url, @"\d+");
+            return match.Success ? match.Value : null;
+        }
     }
 
     private ScrapperResult? GetResult(GetMetadataFieldArgs args)
     {
         if (_didRun) return _result;
 
-        var scrapper = new Scrapper(CustomLogger.GetLogger<Scrapper>(nameof(Scrapper)), new HttpClientHandler());
-
+        var scrapper = new Scrapper(CustomLogger.GetLogger<Scrapper>(nameof(Scrapper)));
         var link = GetLinkFromGame(Game);
+
         if (link is null)
         {
             if (IsBackgroundDownload)
             {
-                // background download so we just choose the first item
-
                 var searchTask = scrapper.ScrapSearchPage(Game.Name, args.CancelToken, _settings.MaxSearchResults,
                     _settings.PreferredLanguage ?? Scrapper.DefaultLanguage);
+
                 searchTask.Wait(args.CancelToken);
 
                 var searchResult = searchTask.Result;
@@ -77,7 +121,17 @@ public class DLSiteMetadataProvider : OnDemandMetadataProvider
                     return null;
                 }
 
-                link = searchResult.First().Href;
+                // Calculate scores and sort by combined score
+                var scoredResults = searchResult.Select(x => new
+                {
+                    Result = x,
+                    Score = StringExtensions.CalculateCombinedScore(Game.Name, x.Title)
+                })
+                .OrderByDescending(x => x.Score)
+                .ThenBy(x => StringExtensions.ExtractIdFromUrl(x.Result.Href))
+                .ToList();
+
+                link = scoredResults.First().Result.Href;
             }
             else
             {
@@ -87,9 +141,10 @@ public class DLSiteMetadataProvider : OnDemandMetadataProvider
                     {
                         var searchTask = scrapper.ScrapSearchPage(searchString, args.CancelToken,
                             _settings.MaxSearchResults, _settings.PreferredLanguage ?? Scrapper.DefaultLanguage);
-                        searchTask.Wait(args.CancelToken);
 
+                        searchTask.Wait(args.CancelToken);
                         var searchResult = searchTask.Result;
+
                         if (searchResult is null || !searchResult.Any())
                         {
                             _logger.LogError("Search return nothing for {Name}", searchString);
@@ -97,12 +152,19 @@ public class DLSiteMetadataProvider : OnDemandMetadataProvider
                             return null;
                         }
 
-                        var items = searchResult
-                            .Select(x => new GenericItemOption(x.Title, x.Href))
-                            .ToList();
+                        // Calculate scores and create options
+                        var items = searchResult.Select(x => new
+                        {
+                            Result = x,
+                            Score = StringExtensions.CalculateCombinedScore(searchString, x.Title)
+                        })
+                        .OrderByDescending(x => x.Score)
+                        .ThenBy(x => StringExtensions.ExtractIdFromUrl(x.Result.Href))
+                        .Select(x => new GenericItemOption(x.Result.Title, x.Result.Href))
+                        .ToList();
 
                         return items;
-                    }, Game.Name, "Search DLsite");
+                    }, Game.Name, "Search Getchu");
 
                 if (item is null)
                 {
@@ -120,8 +182,7 @@ public class DLSiteMetadataProvider : OnDemandMetadataProvider
             return null;
         }
 
-        var task = scrapper.ScrapGamePage(link, args.CancelToken,
-            _settings.PreferredLanguage ?? Scrapper.DefaultLanguage);
+        var task = scrapper.ScrapGamePage(link, args.CancelToken);
         task.Wait(args.CancelToken);
         _result = task.Result;
         _didRun = true;
@@ -140,29 +201,15 @@ public class DLSiteMetadataProvider : OnDemandMetadataProvider
         if (result is null) return base.GetDevelopers(args);
 
         var staff = new List<string>();
+
         if (result.Illustrators is not null && _settings.IncludeIllustrators)
         {
             staff.AddRange(result.Illustrators);
         }
 
-        if (result.MusicCreators is not null && _settings.IncludeMusicCreators)
-        {
-            staff.AddRange(result.MusicCreators);
-        }
-
-        if (result.ScenarioWriters is not null && _settings.IncludeScenarioWriters)
-        {
-            staff.AddRange(result.ScenarioWriters);
-        }
-
-        if (result.VoiceActors is not null && _settings.IncludeVoiceActors)
-        {
-            staff.AddRange(result.VoiceActors);
-        }
-
         var developers = staff
             .Select(name => (name,
-                _playniteAPI.Database.Companies.Where(x => x.Name is not null).FirstOrDefault(company =>
+                _playniteAPI.Database.Companies.FirstOrDefault(company =>
                     company.Name.Equals(name, StringComparison.OrdinalIgnoreCase))))
             .Select(tuple =>
             {
@@ -180,33 +227,86 @@ public class DLSiteMetadataProvider : OnDemandMetadataProvider
         var link = GetResult(args)?.Link;
         if (link is null) yield break;
 
-        yield return new Link("DLsite", link);
+        yield return new Link("Getchu", link);
     }
 
     private MetadataFile? SelectImage(GetMetadataFieldArgs args, string caption)
     {
         var images = GetResult(args)?.ProductImages;
-        if (images is null || !images.Any()) return null;
+        if (images is null || !images.Any())
+        {
+            _logger.Log(LogLevel.Information, "No Select Image {images}", images);
+            return null;
+        }
 
         if (IsBackgroundDownload)
         {
-            return new MetadataFile(images.First());
+            var task = DownloadImageAndGetPath(images.First(), GetResult(args)?.Link);
+            task.Wait();
+            return new MetadataFile(task.Result);
         }
 
+        var link = GetResult(args)?.Link;
         var imageFileOption =
-            _playniteAPI.Dialogs.ChooseImageFile(images.Select(image => new ImageFileOption(image)).ToList(), caption);
+            _playniteAPI.Dialogs.ChooseImageFile(images.Select(image =>
+            {
+                var task = DownloadImageAndGetPath(image, link);
+                task.Wait();
+                return new ImageFileOption(task.Result);
+            }
+            ).ToList(), caption);
         return imageFileOption == null ? null : new MetadataFile(imageFileOption.Path);
     }
 
     public override MetadataFile? GetCoverImage(GetMetadataFieldArgs args)
     {
-        var cover = GetResult(args)?.Cover;
-        if (cover is not null)
+        var icon = GetResult(args)?.Cover;
+        if (icon == null)
         {
-            return new MetadataFile(cover);
+            _logger.Log(LogLevel.Information, "Here Icon");
+            return base.GetIcon(args);
         }
 
-        return cover is null ? base.GetCoverImage(args) : SelectImage(args, "Select Cover Image");
+        var task = DownloadImageAndGetPath(icon, GetResult(args)?.Link);
+        task.Wait();
+        return new MetadataFile(task.Result);
+    }
+
+    public async Task<string?> DownloadImageAndGetPath(string? imageUrl, string? href)
+    {
+        if (imageUrl == null)
+        {
+            return null;
+        }
+
+        var md5 = MD5.Create();
+        var hashBytes = md5.ComputeHash(Encoding.UTF8.GetBytes(imageUrl));
+        var filename = BitConverter.ToString(hashBytes).Replace("-", "") + ".jpg";
+
+        var tempDir = Path.Combine(Path.GetTempPath(), "getchu-images");
+        if (!Directory.Exists(tempDir))
+        {
+            Directory.CreateDirectory(tempDir);
+        }
+
+        var targetFile = Path.Combine(tempDir, filename);
+        if (File.Exists(targetFile))
+        {
+            return targetFile;
+        }
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, imageUrl);
+        if (!href?.StartsWith("https://www.") ?? false)
+        {
+            href = href?.Replace("https://", "https://www.");
+        }
+        request.Headers.Add("Referer", href);
+        var httpResult = await HttpClient.SendAsync(request);
+
+        using var resultStream = await httpResult.Content.ReadAsStreamAsync();
+        using var fileStream = File.Create(targetFile);
+        await resultStream.CopyToAsync(fileStream);
+        return targetFile;
     }
 
     public override MetadataFile? GetBackgroundImage(GetMetadataFieldArgs args)
@@ -225,14 +325,12 @@ public class DLSiteMetadataProvider : OnDemandMetadataProvider
 
     private IEnumerable<MetadataProperty>? GetProperties(GetMetadataFieldArgs args, PlayniteProperty currentProperty)
     {
-        // Categories
         var categoryProperties = PlaynitePropertyHelper.ConvertValuesIfPossible(
             _playniteAPI,
             _settings.CategoryProperty,
             currentProperty,
             () => GetResult(args)?.Categories);
 
-        // Genres
         var genreProperties = PlaynitePropertyHelper.ConvertValuesIfPossible(
             _playniteAPI,
             _settings.GenreProperty,
@@ -263,7 +361,6 @@ public class DLSiteMetadataProvider : OnDemandMetadataProvider
         if (result?.SeriesNames is null) return base.GetSeries(args);
 
         var series = _playniteAPI.Database.Series
-            .Where(x => x.Name is not null)
             .FirstOrDefault(series => series.Name.Equals(result.SeriesNames));
 
         var property = series is null
@@ -272,13 +369,6 @@ public class DLSiteMetadataProvider : OnDemandMetadataProvider
 
         return new[] { property };
     }
-
-    // public override MetadataFile GetIcon(GetMetadataFieldArgs args)
-    // {
-    //     var icon = GetResult(args)?.Icon;
-    //     var current = base.GetIcon(args);
-    //     return current ?? new MetadataFile(icon);
-    // }
 
     public override IEnumerable<MetadataProperty> GetPublishers(GetMetadataFieldArgs args)
     {
@@ -290,18 +380,7 @@ public class DLSiteMetadataProvider : OnDemandMetadataProvider
         var result = GetResult(args);
         if (result is null) return base.GetDescription(args);
 
-        return result.DescriptionHtml?.Trim() ?? "";
-    }
-
-    public override int? GetCommunityScore(GetMetadataFieldArgs args)
-    {
-        var result = GetResult(args);
-        return result?.Score;
-    }
-
-    public override IEnumerable<MetadataProperty> GetAgeRatings(GetMetadataFieldArgs args)
-    {
-        return new[] { new MetadataNameProperty(GetResult(args)?.AgeRating) };
+        return result.DescriptionHtml ?? "";
     }
 
     public override IEnumerable<MetadataProperty> GetRegions(GetMetadataFieldArgs args)
