@@ -1,8 +1,9 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Extensions.Common;
@@ -38,7 +39,6 @@ public class FanzaMetadataProvider : OnDemandMetadataProvider
         _logger = CustomLogger.GetLogger<FanzaMetadataProvider>(nameof(FanzaMetadataProvider));
     }
 
-
     private static ScrapperManager SetupScrapperManager()
     {
         var clientHandler = new HttpClientHandler();
@@ -63,6 +63,77 @@ public class FanzaMetadataProvider : OnDemandMetadataProvider
         return new ScrapperManager(new List<IScrapper>() { gameScrapper, doujinGameScrapper });
     }
 
+    private static readonly List<string> ExclusionPatterns = new List<string>
+    {
+        @"【[^】]*】", // 匹配方括号及其内容
+        @"DL EDITION",
+        @"DL版", // 其他排除项
+        // 您可以在这里添加更多排除项，格式为 @"内容"
+    };
+
+    private static string CleanString(string input)
+    {
+        // 从输入中去掉首尾空格
+        string cleaned = input.Trim();
+
+        // 根据排除项清理内容
+        foreach (var pattern in ExclusionPatterns)
+        {
+            cleaned = Regex.Replace(cleaned, pattern, "", RegexOptions.IgnoreCase).Trim();
+        }
+
+        return cleaned;
+    }
+
+    private static int LevenshteinDistance(string s, string t)
+    {
+        var n = s.Length;
+        var m = t.Length;
+        var d = new int[n + 1, m + 1];
+
+        for (int i = 0; i <= n; i++) d[i, 0] = i;
+        for (int j = 0; j <= m; j++) d[0, j] = j;
+
+        for (int i = 1; i <= n; i++)
+        {
+            for (int j = 1; j <= m; j++)
+            {
+                int cost = (t[j - 1] == s[i - 1]) ? 0 : 1;
+                d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
+            }
+        }
+
+        return d[n, m];
+    }
+
+    private static double CalculateCombinedScore(string searchString, string itemName)
+    {
+        var cleanedSearchString = CleanString(searchString.ToLower());
+        var cleanedItemName = CleanString(itemName.ToLower());
+
+        var levenshteinDistance = LevenshteinDistance(cleanedSearchString, cleanedItemName);
+        var exactMatchScore = cleanedItemName.Equals(cleanedSearchString, StringComparison.OrdinalIgnoreCase) ? 100 : 0;
+        var partialMatchScore = cleanedItemName.IndexOf(cleanedSearchString, StringComparison.OrdinalIgnoreCase) >= 0 ? 50 : 0;
+
+        return exactMatchScore > 0 ? 100 : 100 - (levenshteinDistance + partialMatchScore);
+    }
+
+    private static string ExtractIdFromUrl(string url)
+    {
+        var uri = new Uri(url);
+        var queryParams = uri.Query.TrimStart('?')
+            .Split('&') // 使用字符分隔符，不使用 StringSplitOptions
+            .Select(p => p.Split('='))
+            .ToDictionary(kv => WebUtility.UrlDecode(kv[0]), kv => kv.Length > 1 ? WebUtility.UrlDecode(kv[1]) : string.Empty);
+
+        if (queryParams.TryGetValue("cid", out var cid))
+        {
+            return cid;
+        }
+
+        return uri.AbsolutePath.Split('/').LastOrDefault(segment => segment.StartsWith("detail"))?.Split('=').Last() ?? string.Empty;
+    }
+
     private ScrapperResult? GetResult(GetMetadataFieldArgs args)
     {
         if (_didRun) return _result;
@@ -80,26 +151,36 @@ public class FanzaMetadataProvider : OnDemandMetadataProvider
 
         if (string.IsNullOrWhiteSpace(Game.Name))
         {
-            _logger.LogError("Unable to metadata cuz links and name are not available");
+            _logger.LogError("Unable to fetch metadata because links and name are not available");
             _didRun = true;
             return null;
         }
 
         if (IsBackgroundDownload)
         {
-            // background download so we just choose the first item
             var searchTask = scrapperManager.ScrapSearchPage(Game.Name, args.CancelToken);
             searchTask.Wait(args.CancelToken);
-
             var searchResult = searchTask.Result;
-            if (!searchResult.Any())
+
+            // Apply scoring and sorting
+            var scoredResults = searchResult
+                .Select(x => new
+                {
+                    Result = x,
+                    Score = CalculateCombinedScore(Game.Name, x.Name)
+                })
+                .OrderByDescending(x => x.Score)
+                .ThenBy(x => ExtractIdFromUrl(x.Result.Href))
+                .ToList();
+
+            if (!scoredResults.Any())
             {
-                _logger.LogError("Search return nothing for {Name}, make sure you are logged in!", Game.Name);
+                _logger.LogError("Search returned nothing for {Name}, make sure you are logged in!", Game.Name);
                 _didRun = true;
                 return null;
             }
 
-            choosedGameUrl = searchResult.First().Href;
+            choosedGameUrl = scoredResults.First().Result.Href;
         }
         else
         {
@@ -110,16 +191,24 @@ public class FanzaMetadataProvider : OnDemandMetadataProvider
                     var searchTask = scrapperManager.ScrapSearchPage(searchString, args.CancelToken);
                     searchTask.Wait(args.CancelToken);
                     var searchResult = searchTask.Result;
-                    if (searchResult is null || !searchResult.Any())
+                    if (searchResult == null || !searchResult.Any())
                     {
-                        _logger.LogError("Search return nothing, make sure you are logged in!");
+                        _logger.LogError("Search returned nothing, make sure you are logged in!");
                         _didRun = true;
                         return null;
                     }
 
-                    var items = searchResult
-                        .Select(x => new GenericItemOption(x.Name, x.Href))
+                    var scoredResults = searchResult
+                        .Select(x => new
+                        {
+                            Result = x,
+                            Score = CalculateCombinedScore(searchString, x.Name)
+                        })
+                        .OrderByDescending(x => x.Score)
+                        .ThenBy(x => ExtractIdFromUrl(x.Result.Href))
                         .ToList();
+
+                    var items = scoredResults.Select(x => new GenericItemOption(x.Result.Name, x.Result.Href)).ToList();
 
                     return items;
                 }, Game.Name, "Search Fanza");
@@ -179,7 +268,6 @@ public class FanzaMetadataProvider : OnDemandMetadataProvider
             return new List<SearchResult>();
         }
 
-
         public async Task<ScrapperResult?> ScrapGamePage(SearchResult searchResult, CancellationToken cancellationToken)
         {
             foreach (var scrapper in _scrappers)
@@ -197,7 +285,6 @@ public class FanzaMetadataProvider : OnDemandMetadataProvider
                          && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
             if (!result) return null;
 
-
             foreach (var scrapper in _scrappers)
             {
                 var res = await scrapper.ScrapGamePage(link, cancellationToken);
@@ -212,13 +299,6 @@ public class FanzaMetadataProvider : OnDemandMetadataProvider
     {
         return GetResult(args)?.Title ?? base.GetName(args);
     }
-
-    // Use .exe icon as default
-    // public override MetadataFile GetIcon(GetMetadataFieldArgs args)
-    // {
-    //     var iconUrl = GetResult(args)?.IconUrl;
-    //     return iconUrl is null ? base.GetIcon(args) : new MetadataFile(iconUrl);
-    // }
 
     public override IEnumerable<MetadataProperty> GetDevelopers(GetMetadataFieldArgs args)
     {
@@ -275,8 +355,7 @@ public class FanzaMetadataProvider : OnDemandMetadataProvider
     public override string GetDescription(GetMetadataFieldArgs args)
     {
         var result = GetResult(args);
-        if (result is null) return base.GetDescription(args);
-        return result.Description?.Trim() ?? "";
+        return result?.Description?.Trim() ?? base.GetDescription(args);
     }
 
     public override IEnumerable<MetadataProperty> GetAgeRatings(GetMetadataFieldArgs args)
